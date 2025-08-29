@@ -1,1 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDE/에디터
+.vscode/
+.idea/
+
+# 환경 설정
 config.ini
+.env
+
+# 데이터 파일
+user_stats.json
+mang.json
+bad_words.json
