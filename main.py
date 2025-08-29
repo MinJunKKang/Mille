@@ -10,6 +10,7 @@ from cogs.economy import EconomyCog
 from cogs.stats_view import StatsCog
 from cogs.fun_cog import FunCog
 from cogs.moderation_cog import ModerationCog
+from cogs.gamble_cog import GambleCog
 
 # from 포켓몬8 import subtract_points_from_user, save_user_data, get_user_points, place_bet, process_betting_result
 
@@ -34,10 +35,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def setup_hook():
     await bot.add_cog(MatchCog(bot, role_ids=ROLE_IDS))
-    await bot.add_cog(EconomyCog(bot))
+    await bot.add_cog(EconomyCog(bot, grant_role_ids={k:v for k,v in ROLE_IDS.items() if k!="내전"}))
     await bot.add_cog(StatsCog(bot))
     await bot.add_cog(FunCog(bot))
-    await bot.add_cog(ModerationCog(bot, role_ids=CLEANUP_ROLE_IDS))
+    await bot.add_cog(ModerationCog(bot, role_ids=ROLE_IDS))
+    await bot.add_cog(GambleCog(bot))
 
 game_counter = 1
 games = {}  
