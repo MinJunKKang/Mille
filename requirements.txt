@@ -1,0 +1,5 @@
+# Requirements for the Discord bot
+discord.py
+pytz
+rich
+APScheduler
