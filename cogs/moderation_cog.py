@@ -103,7 +103,7 @@ class ModerationCog(commands.Cog):
                 return True
             return False
 
-        @discord.ui.button(label="예", style=discord.ButtonStyle.danger, emoji="🧹")
+        @discord.ui.button(label="예", style=discord.ButtonStyle.success, emoji="🧹")
         async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_others(interaction):
                 return
@@ -133,7 +133,7 @@ class ModerationCog(commands.Cog):
 
             self.stop()
 
-        @discord.ui.button(label="아니오", style=discord.ButtonStyle.secondary, emoji="✋")
+        @discord.ui.button(label="아니오", style=discord.ButtonStyle.secondary, emoji="❌")
         async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_others(interaction):
                 return
