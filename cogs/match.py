@@ -7,9 +7,12 @@ import json
 import discord
 from discord.ext import commands
 from discord.ui import View, Button, Select, Modal, TextInput
-from typing import Dict, Set, List, Optional
+from typing import Dict, Set, List, Optional, Tuple
 
 from utils.stats import update_result_dual, MANG_PATH  # 승/패 기록 반영
+
+# 내전 기록 채널(텍스트 채널) ID
+MATCH_LOG_CHANNEL_ID = 1409174709718880329
 
 # ===== 도우미 함수 =====
 def create_opgg_multisearch_url(summoner_list: List[str]) -> str:
@@ -39,6 +42,7 @@ class Game:
         self.result_message: Optional[discord.Message] = None
         self.team_status_message: Optional[discord.Message] = None
         self.bets: Dict[int, Dict[str, int]] = {}
+        self.pick_history: List[Tuple[int, int]] = []  # (team_num, user_id)
 
     def is_full(self) -> bool:
         return len(self.participants) >= self.max_players
@@ -66,6 +70,17 @@ class MatchCog(commands.Cog):
         self.game_counter: int = 1
         self.games: Dict[int, Game] = {}
         self.active_hosts: Set[int] = set()
+
+    def _get_match_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """내전 기록을 보낼 텍스트 채널을 찾는다."""
+        ch = guild.get_channel(MATCH_LOG_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+            return ch
+        # 폴백: 봇이 보낼 수 있는 첫 텍스트 채널
+        for c in guild.text_channels:
+            if c.permissions_for(guild.me).send_messages:
+                return c
+        return None
 
     # --------- 내부 유틸 ---------
     async def get_sorted_participants_by_tier(self, guild: discord.Guild, user_ids: List[int]) -> List[str]:
@@ -200,13 +215,57 @@ class MatchCog(commands.Cog):
                     await interaction.response.send_message("이미 선택된 유저입니다.", ephemeral=True)
                     return
 
+                # 선택 반영
                 game.teams[team_num].append(uid)
                 available.remove(uid)
+
+                # 히스토리 기록 (되돌리기용)
+                game.pick_history.append((team_num, uid))
+
+                # 턴 진행
                 game.draft_turn += 1
 
+                # 팀 현황 갱신 + 현재 선택 UI 삭제 후 다음 UI 띄우기
                 await game.team_status_message.edit(embed=create_team_embed())
                 await interaction.message.delete()
                 await cog.send_draft_ui(channel, game, available)
+
+            @discord.ui.button(label="↩ 되돌리기", style=discord.ButtonStyle.secondary)
+            async def undo_pick(self, interaction: discord.Interaction, button: Button):
+                # 권한: 개최자 또는 관리자만
+                if interaction.user.id != game.host_id and not interaction.user.guild_permissions.manage_guild:
+                    await interaction.response.send_message("되돌리기는 개최자 또는 관리자만 가능합니다.", ephemeral=True)
+                    return
+
+                if not game.pick_history:
+                    await interaction.response.send_message("되돌릴 선택이 없습니다.", ephemeral=True)
+                    return
+
+                # 마지막 픽 되돌리기
+                last_team, last_uid = game.pick_history.pop()
+
+                # 팀에서 제거
+                if last_uid in game.teams[last_team]:
+                    game.teams[last_team].remove(last_uid)
+
+                # 다시 선택 가능 목록에 복귀
+                if last_uid not in available:
+                    available.append(last_uid)
+
+                # 턴 되돌리기
+                if game.draft_turn > 0:
+                    game.draft_turn -= 1
+
+                # 팀 현황 갱신
+                await game.team_status_message.edit(embed=create_team_embed())
+
+                # 현재 선택 UI 교체
+                try:
+                    await interaction.message.delete()
+                except:
+                    pass
+                await cog.send_draft_ui(channel, game, available)
+
 
         embed = discord.Embed(
             title=f"{team_num}팀 팀원 선택",
@@ -254,6 +313,23 @@ class MatchCog(commands.Cog):
 
         opgg_view = self.OpggButtonView(opgg1, opgg2)
         await channel.send(view=opgg_view)
+
+        log_ch = self._get_match_log_channel(guild)
+        if log_ch:
+            host_member = guild.get_member(game.host_id)
+            host_name = host_member.display_name if host_member else str(game.host_id)
+
+            log_embed = discord.Embed(
+                title=f"⚔️ 내전 #{game.id} 팀 구성 완료",
+                description=f"개최자: {host_name}",
+                color=0x2F3136
+            )
+            log_embed.add_field(name="🟦 1팀", value=t1 or "- 없음", inline=True)
+            log_embed.add_field(name="🟥 2팀", value=t2 or "- 없음", inline=True)
+            log_embed.set_footer(text="아래 버튼으로 전적 확인")
+
+            # 기록방에도 OPGG 버튼 함께 전송
+            await log_ch.send(embed=log_embed, view=self.OpggButtonView(opgg1, opgg2))
 
         asyncio.create_task(self.disable_buttons_after_timeout(result_message, result_view, 10800))
         await channel.send(view=self.BettingView(game))
