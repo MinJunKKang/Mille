@@ -2,6 +2,7 @@
 import asyncio
 import random
 import math
+import configparser
 import discord
 from discord.ext import commands
 from discord.ext.commands import BucketType
@@ -14,6 +15,26 @@ MIN_BET = 1000            # 최소 베팅
 TICK_SEC = 0.25           # (그래프) 화면 갱신 간격(초)
 GROWTH_PER_TICK = 1.045   # (그래프) 한 틱마다 배율 * 1.045 (약 4.5% 상승)
 MAX_MULTIPLIER = 30.0     # (그래프) 배율 상한
+
+# ===== config.ini에서 채널 ID 읽기 =====
+_cfg = configparser.ConfigParser()
+try:
+    _cfg.read("config.ini", encoding="utf-8")
+except Exception:
+    pass
+
+def _get_id(section: str, key: str) -> int:
+    """config.ini에서 정수 ID 읽기 (없거나 잘못되면 0)."""
+    try:
+        val = _cfg.get(section, key, fallback="0")
+        return int(val) if str(val).isdigit() else 0
+    except Exception:
+        return 0
+
+# 도박장(명령 허용) 채널 / 도박 결과 로그 채널
+GAMBLE_CHANNEL_ID     = _get_id("Gamble", "gamble_channel_id")
+GAMBLE_LOG_CHANNEL_ID = _get_id("Gamble", "gamble_log_channel_id")
+
 
 def roll_crash_point():
     """크래시 지점 샘플링(운영자 이득 쪽으로 기울어진 분포)"""
@@ -39,19 +60,57 @@ class GambleCog(commands.Cog):
         self.active_crash_users: set[int] = set()   # 그래프 도박 동시 진행 방지
         self.active_rps_users: set[int] = set()     # RPS 도박 동시 진행 방지
 
+    # ───────────────── 공지/채널 유틸 ─────────────────
+    def _get_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        """로그 채널이 있으면 우선, 아니면 봇이 글을 보낼 수 있는 첫 텍스트 채널."""
+        if GAMBLE_LOG_CHANNEL_ID:
+            ch = guild.get_channel(GAMBLE_LOG_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+                return ch
+        for c in guild.text_channels:
+            if c.permissions_for(guild.me).send_messages:
+                return c
+        return None
+
+    async def _send_gamble_log(self, guild: discord.Guild | None, *, title: str, description: str, color: int):
+        if guild is None:
+            return
+        ch = self._get_log_channel(guild)
+        if not ch:
+            return
+        try:
+            embed = discord.Embed(title=title, description=description, color=color)
+            await ch.send(embed=embed)
+        except Exception:
+            pass
+
+    def _check_gamble_channel(self, ctx: commands.Context) -> bool:
+        """도박 명령 사용 가능 채널인지 확인. (설정 없으면 제한 없음)"""
+        if not ctx.guild or GAMBLE_CHANNEL_ID == 0:
+            return True
+        return ctx.channel.id == GAMBLE_CHANNEL_ID
+
+    def _allowed_mention(self) -> str:
+        return f"<#{GAMBLE_CHANNEL_ID}>" if GAMBLE_CHANNEL_ID else "도박장(관리자 설정 필요)"
+
     # =================================================================
-    # = !도박1 버튼 도박 =
+    # = !도박1 버튼 도박 (4x4, 폭탄6, 배율10 고정 분배, 결과 시 전칸 공개) =
     # =================================================================
     @commands.command(name="도박1")
     @commands.cooldown(rate=1, per=7, type=BucketType.user)  # 유저당 7초 쿨다운
     async def mines_game(self, ctx: commands.Context, amount: int):
         """
-        버튼 도박(마인류):
-        - 4x5 격자(20칸) 중 무작위 폭탄 5개
-        - 안전 칸은 1.10x ~ 1.50x 배율이 뜨고, 누적 배율에 곱해짐
-        - [수령]을 누르면 베팅 * 누적배율 지급
-        - 폭탄을 누르면 베팅액 소실
+        버튼 도박(마인류)
+        - 4x4 격자(16칸): 폭탄 6개 + 배율칸 10개
+        - 배율칸의 배당은 고정 목록을 무작위 배치:
+          [0.5, 0.5, 0.6, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0]
+        - 결과가 나오면 모든 칸 공개 + 로그 채널 공지
         """
+        # 채널 제한
+        if not self._check_gamble_channel(ctx):
+            await ctx.reply(f"이 명령은 {self._allowed_mention()} 에서만 사용할 수 있어요.", delete_after=5)
+            return
+
         if amount < MIN_BET:
             await ctx.reply(f"최소 베팅 금액은 {format_num(MIN_BET)} P 입니다.", delete_after=5)
             return
@@ -64,15 +123,21 @@ class GambleCog(commands.Cog):
 
         self.active_mines_users.add(ctx.author.id)
 
-        ROWS, COLS = 4, 5
+        # ----- 보드 구성: 4x4 / 폭탄 6 / 배율 10 -----
+        ROWS, COLS = 4, 4
         NCELLS = ROWS * COLS
-        NUM_BOMBS = 5
+        NUM_BOMBS = 6
 
         bomb_positions = set(random.sample(range(NCELLS), NUM_BOMBS))
-        mult_values: dict[int, float] = {}
-        for i in range(NCELLS):
-            if i not in bomb_positions:
-                mult_values[i] = round(random.uniform(1.10, 1.50), 2)
+
+        MULTIPLIER_POOL = [0.5, 0.5, 0.6, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0]
+        random.shuffle(MULTIPLIER_POOL)
+        safe_cells = [i for i in range(NCELLS) if i not in bomb_positions]
+        assert len(safe_cells) == len(MULTIPLIER_POOL), "보드/폭탄/배율 개수 불일치"
+
+        mult_values: dict[int, float] = {
+            idx: MULTIPLIER_POOL[pos] for idx, pos in zip(safe_cells, range(len(MULTIPLIER_POOL)))
+        }
 
         revealed: set[int] = set()
         ended = False
@@ -86,11 +151,32 @@ class GambleCog(commands.Cog):
                 f"베팅: **{format_num(amount)} P**",
                 f"현재 누적 배율: **{cumulative:.2f}x**",
                 f"예상 수령: **{format_num(int(math.floor(amount * cumulative)))} P**",
+                "구성: 폭탄 6개 + 배율 10개(0.5, 0.5, 0.6, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0)"
             ]
             color = discord.Color.green() if not crashed else discord.Color.red()
             return discord.Embed(title=title, description="\n".join(desc), color=color)
 
-        view_message: discord.Message | None = None  # view에서 접근할 수 있도록 외부에 둠
+        view_message: discord.Message | None = None
+        outer_self = self
+
+        # ----- 결과 시 전칸 공개 헬퍼 -----
+        def reveal_all_buttons(view: discord.ui.View):
+            for item in view.children:
+                if isinstance(item, discord.ui.Button) and hasattr(item, "idx"):
+                    idx = getattr(item, "idx")
+                    if idx in bomb_positions:
+                        item.style = discord.ButtonStyle.danger
+                        item.emoji = "💣"
+                        item.label = ""
+                    else:
+                        m = mult_values[idx]
+                        item.style = discord.ButtonStyle.success if idx in revealed else discord.ButtonStyle.primary
+                        item.emoji = None
+                        item.label = f"x{m:.2f}"
+                    item.disabled = True
+                else:
+                    if isinstance(item, discord.ui.Button):
+                        item.disabled = True
 
         class CellButton(discord.ui.Button):
             def __init__(self, idx: int, *, row: int):
@@ -112,31 +198,29 @@ class GambleCog(commands.Cog):
                 revealed.add(self.idx)
 
                 if self.idx in bomb_positions:
-                    # 폭탄 → 종료
+                    # 폭탄 → 종료 + 전칸 공개 + 로그
                     ended = True
                     self.style = discord.ButtonStyle.danger
                     self.emoji = "💣"
                     self.label = ""
                     self.disabled = True
 
-                    # 나머지 버튼 비활성화
-                    for item in view.children:
-                        if isinstance(item, discord.ui.Button):
-                            item.disabled = True
-
-                    lost_extra = max(0, int(math.floor(amount * (cumulative - 1.0))))
+                    reveal_all_buttons(view)
                     end_embed = discord.Embed(
                         title="💥 폭탄 발동! 게임 종료",
-                        description=(
-                            f"😵 {interaction.user.mention} 님이 폭탄을 열어 게임이 종료되었습니다!\n"
-                            f"누적 보상 **{format_num(lost_extra)}P**가 사라졌습니다."
-                        ),
+                        description=(f"😵 {interaction.user.mention} 님이 폭탄을 열었습니다!\n"
+                                     f"베팅 **{format_num(amount)} P** 를 잃었습니다."),
                         color=discord.Color.red(),
                     )
-
-                    # 메시지 갱신 + 즉시 정리
                     await interaction.response.edit_message(embed=end_embed, view=view)
-                    view.stop()  # <── 중요: cleanup을 즉시 트리거
+
+                    await outer_self._send_gamble_log(
+                        interaction.guild,
+                        title="🎰 도박 로그 - 버튼(폭탄)",
+                        description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** → **-{format_num(amount)} P** 손실"),
+                        color=discord.Color.red().value
+                    )
+                    view.stop()
                     return
 
                 # 안전 칸 → 배율 반영
@@ -164,32 +248,35 @@ class GambleCog(commands.Cog):
                 payout = int(math.floor(amount * cumulative))
                 add_points(ctx.author.id, payout)
 
-                # 모든 버튼 비활성화
-                for item in view.children:
-                    if isinstance(item, discord.ui.Button):
-                        item.disabled = True
+                reveal_all_buttons(view)
 
                 done = discord.Embed(
                     title="🏁 수령 완료",
-                    description=(
-                        f"누적 배율 **{cumulative:.2f}x** 에서 **{format_num(payout)} P** 지급!\n"
-                        f"현재 보유: **{format_num(get_points(ctx.author.id))} P**"
-                    ),
+                    description=(f"누적 배율 **{cumulative:.2f}x** 에서 **{format_num(payout)} P** 지급!\n"
+                                 f"현재 보유: **{format_num(get_points(ctx.author.id))} P**"),
                     color=discord.Color.blurple(),
                 )
                 try:
                     await interaction.response.edit_message(embed=done, view=view)
                 finally:
-                    view.stop()  # <── 중요: 즉시 정리
+                    net = payout - amount
+                    sign = "+" if net >= 0 else "-"
+                    await outer_self._send_gamble_log(
+                        interaction.guild,
+                        title="🎰 도박 로그 - 버튼(수령)",
+                        description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** "
+                                     f"→ 수령 **{format_num(payout)} P** (**{sign}{format_num(abs(net))} P**) "
+                                     f"배율 **{cumulative:.2f}x**"),
+                        color=discord.Color.gold().value
+                    )
+                    view.stop()
 
         class MinesView(discord.ui.View):
             def __init__(self):
                 super().__init__(timeout=120)  # 2분 제한
-                # 격자 버튼 생성
                 for i in range(NCELLS):
                     row = i // COLS
                     self.add_item(CellButton(i, row=row))
-                # 수령 버튼
                 self.add_item(CashOutButton())
 
             async def on_timeout(self):
@@ -197,21 +284,24 @@ class GambleCog(commands.Cog):
                 if ended or cashed:
                     self.stop()
                     return
-                # 시간 초과 → 패배 처리
                 ended = True
-                for item in self.children:
-                    if isinstance(item, discord.ui.Button):
-                        item.disabled = True
+                reveal_all_buttons(self)
                 to = discord.Embed(
                     title="⏱️ 시간 초과로 종료",
-                    description=f"선택 시간이 초과되어 베팅 {format_num(amount)} P 를 잃었습니다.",
+                    description=(f"선택 시간이 초과되어 베팅 {format_num(amount)} P 를 잃었습니다."),
                     color=discord.Color.dark_grey(),
                 )
                 try:
                     if view_message:
                         await view_message.edit(embed=to, view=self)
                 finally:
-                    self.stop()  # <── 타임아웃도 즉시 정리
+                    await outer_self._send_gamble_log(
+                        view_message.guild if view_message else None,
+                        title="🎰 도박 로그 - 버튼(시간초과)",
+                        description=(f"{ctx.author.mention} 베팅 **{format_num(amount)} P** → **-{format_num(amount)} P** 손실"),
+                        color=discord.Color.dark_grey().value
+                    )
+                    self.stop()
 
         view = MinesView()
         msg = await ctx.send(embed=build_embed(), view=view)
@@ -219,7 +309,7 @@ class GambleCog(commands.Cog):
 
         async def cleanup():
             try:
-                await view.wait()  # stop() 호출/타임아웃 시 즉시 반환
+                await view.wait()
             finally:
                 self.active_mines_users.discard(ctx.author.id)
 
@@ -231,6 +321,10 @@ class GambleCog(commands.Cog):
     @commands.command(name="도박2")
     @commands.cooldown(rate=1, per=10, type=BucketType.user)  # 유저당 10초 쿨다운
     async def crash_game(self, ctx: commands.Context, amount: int):
+        if not self._check_gamble_channel(ctx):
+            await ctx.reply(f"이 명령은 {self._allowed_mention()} 에서만 사용할 수 있어요.", delete_after=5)
+            return
+
         if amount < MIN_BET:
             await ctx.reply(f"최소 베팅 금액은 {format_num(MIN_BET)} P 입니다.", delete_after=5)
             return
@@ -242,6 +336,7 @@ class GambleCog(commands.Cog):
             return
 
         self.active_crash_users.add(ctx.author.id)
+        outer_self = self
 
         crash_at = roll_crash_point()
         multiplier = 1.00
@@ -272,15 +367,23 @@ class GambleCog(commands.Cog):
                     f"✅ {interaction.user.mention} {cash_multi}x 에서 **{format_num(gain)} P** 수령!",
                     ephemeral=True
                 )
+                net = gain - amount
+                sign = "+" if net >= 0 else "-"
+                await outer_self._send_gamble_log(
+                    interaction.guild,
+                    title="🎰 도박 로그 - 그래프(수령)",
+                    description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** "
+                                 f"→ 수령 **{format_num(gain)} P** (**{sign}{format_num(abs(net))} P**) "
+                                 f"최종 **{cash_multi}x**"),
+                    color=discord.Color.gold().value
+                )
 
         view = CashOutView()
         embed = discord.Embed(
             title="🎲 그래프 도박 (Crash)",
-            description=(
-                f"베팅: **{format_num(amount)} P**\n"
-                f"버튼을 눌러 **크래시 전에** 수령하세요!\n"
-                f"현재 배율: **{multiplier:.2f}x**"
-            ),
+            description=(f"베팅: **{format_num(amount)} P**\n"
+                         f"버튼을 눌러 **크래시 전에** 수령하세요!\n"
+                         f"현재 배율: **{multiplier:.2f}x**"),
             color=discord.Color.blurple()
         )
         msg = await ctx.send(embed=embed, view=view)
@@ -292,11 +395,9 @@ class GambleCog(commands.Cog):
                 multiplier = min(multiplier, MAX_MULTIPLIER)
                 embed = discord.Embed(
                     title="🎲 그래프 도박 (Crash)",
-                    description=(
-                        f"베팅: **{format_num(amount)} P**\n"
-                        f"현재 배율: **{multiplier:.2f}x**\n"
-                        f"수령은 **크래시 전**에!"
-                    ),
+                    description=(f"베팅: **{format_num(amount)} P**\n"
+                                 f"현재 배율: **{multiplier:.2f}x**\n"
+                                 f"수령은 **크래시 전**에!"),
                     color=discord.Color.blurple()
                 )
                 await msg.edit(embed=embed, view=view)
@@ -308,24 +409,27 @@ class GambleCog(commands.Cog):
                 after = get_points(ctx.author.id)
                 end = discord.Embed(
                     title="🏁 결과",
-                    description=(
-                        f"수령 성공! **{format_num(cashed_amount)} P** 획득\n"
-                        f"최종 배율: **{min(multiplier, crash_at):.2f}x**\n"
-                        f"현재 보유: **{format_num(after)} P**"
-                    ),
+                    description=(f"수령 성공! **{format_num(cashed_amount)} P** 획득\n"
+                                 f"최종 배율: **{min(multiplier, crash_at):.2f}x**\n"
+                                 f"현재 보유: **{format_num(after)} P**"),
                     color=discord.Color.green()
                 )
                 await msg.edit(embed=end, view=view)
             else:
                 end = discord.Embed(
                     title="💥 CRASHED!",
-                    description=(
-                        f"크래시 지점: **{crash_at:.2f}x**\n"
-                        f"아쉽지만 베팅 {format_num(amount)} P 를 잃었습니다…"
-                    ),
+                    description=(f"크래시 지점: **{crash_at:.2f}x**\n"
+                                 f"아쉽지만 베팅 {format_num(amount)} P 를 잃었습니다…"),
                     color=discord.Color.red()
                 )
                 await msg.edit(embed=end, view=view)
+                await outer_self._send_gamble_log(
+                    ctx.guild,
+                    title="🎰 도박 로그 - 그래프(폭파)",
+                    description=(f"{ctx.author.mention} 베팅 **{format_num(amount)} P** → **-{format_num(amount)} P** 손실 "
+                                 f"(지점 **{crash_at:.2f}x**)"),
+                    color=discord.Color.red().value
+                )
         finally:
             self.active_crash_users.discard(ctx.author.id)
 
@@ -335,12 +439,10 @@ class GambleCog(commands.Cog):
     @commands.command(name="도박3")
     @commands.cooldown(rate=1, per=5, type=BucketType.user)  # 유저당 5초 쿨다운
     async def rps_game(self, ctx: commands.Context, amount: int):
-        """
-        가위바위보 도박:
-          - 승  : 랜덤 1.10x ~ 2.00x 배당(베팅 포함) 지급
-          - 비김: 멘징(본전 환불)
-          - 패배: 베팅액 소실
-        """
+        if not self._check_gamble_channel(ctx):
+            await ctx.reply(f"이 명령은 {self._allowed_mention()} 에서만 사용할 수 있어요.", delete_after=5)
+            return
+
         if amount < MIN_BET:
             await ctx.reply(f"최소 베팅 금액은 {format_num(MIN_BET)} P 입니다.", delete_after=5)
             return
@@ -356,12 +458,11 @@ class GambleCog(commands.Cog):
         user_resolved = False
         choices = ["가위", "바위", "보"]
         emojis = {"가위": "✌️", "바위": "✊", "보": "✋"}
+        outer_self = self
 
-        desc = (
-            f"베팅: **{format_num(amount)} P**\n"
-            f"아래 버튼에서 선택하세요! (승: **1.10x~2.00x 랜덤**, 비김: **멘징**, 패배: **소실**)\n"
-            f"시간 제한: 15초"
-        )
+        desc = (f"베팅: **{format_num(amount)} P**\n"
+                f"아래 버튼에서 선택하세요! (승: **1.10x~2.00x 랜덤**, 비김: **멘징**, 패배: **소실**)\n"
+                f"시간 제한: 15초")
         embed = discord.Embed(title="🎮 가위바위보 도박", description=desc, color=discord.Color.green())
 
         class RPSView(discord.ui.View):
@@ -402,30 +503,50 @@ class GambleCog(commands.Cog):
                 if bot_choice == user_choice:
                     add_points(ctx.author.id, amount)
                     result_title = "🤝 비겼습니다 (멘징)"
-                    result_desc = (
-                        f"당신: {emojis[user_choice]} **{user_choice}** vs 봇: {emojis[bot_choice]} **{bot_choice}**\n"
-                        f"본전 **{format_num(amount)} P** 반환되었습니다."
-                    )
+                    result_desc = (f"당신: {emojis[user_choice]} **{user_choice}** vs "
+                                   f"봇: {emojis[bot_choice]} **{bot_choice}**\n"
+                                   f"본전 **{format_num(amount)} P** 반환되었습니다.")
                     color = discord.Color.greyple()
+                    await outer_self._send_gamble_log(
+                        interaction.guild,
+                        title="🎰 도박 로그 - 가위바위보(비김)",
+                        description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** → 손익 **±0 P**"),
+                        color=discord.Color.greyple().value
+                    )
 
                 elif wins[user_choice] == bot_choice:
                     multi = round(random.uniform(1.10, 2.00), 2)
                     payout = int(math.floor(amount * multi))
                     add_points(ctx.author.id, payout)
                     result_title = "🏆 승리!"
-                    result_desc = (
-                        f"당신: {emojis[user_choice]} **{user_choice}** vs 봇: {emojis[bot_choice]} **{bot_choice}**\n"
-                        f"배당 **{multi}x** → **{format_num(payout)} P** 지급!"
-                    )
+                    result_desc = (f"당신: {emojis[user_choice]} **{user_choice}** vs "
+                                   f"봇: {emojis[bot_choice]} **{bot_choice}**\n"
+                                   f"배당 **{multi}x** → **{format_num(payout)} P** 지급!")
                     color = discord.Color.gold()
+                    net = payout - amount
+                    sign = "+" if net >= 0 else "-"
+                    await outer_self._send_gamble_log(
+                        interaction.guild,
+                        title="🎰 도박 로그 - 가위바위보(승리)",
+                        description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** "
+                                     f"→ 수령 **{format_num(payout)} P** (**{sign}{format_num(abs(net))} P**), "
+                                     f"배율 **{multi}x**"),
+                        color=discord.Color.gold().value
+                    )
 
                 else:
                     result_title = "💣 패배…"
-                    result_desc = (
-                        f"당신: {emojis[user_choice]} **{user_choice}** vs 봇: {emojis[bot_choice]} **{bot_choice}**\n"
-                        f"베팅 {format_num(amount)} P 를 잃었습니다."
-                    )
+                    result_desc = (f"당신: {emojis[user_choice]} **{user_choice}** vs "
+                                   f"봇: {emojis[bot_choice]} **{bot_choice}**\n"
+                                   f"베팅 {format_num(amount)} P 를 잃었습니다.")
                     color = discord.Color.red()
+                    await outer_self._send_gamble_log(
+                        interaction.guild,
+                        title="🎰 도박 로그 - 가위바위보(패배)",
+                        description=(f"{interaction.user.mention} 베팅 **{format_num(amount)} P** "
+                                     f"→ **-{format_num(amount)} P** 손실"),
+                        color=discord.Color.red().value
+                    )
 
                 user_resolved = True
                 for c in self.children:
