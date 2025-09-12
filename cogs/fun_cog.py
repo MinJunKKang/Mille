@@ -1,5 +1,6 @@
 # cogs/fun_cog.py
 import random
+from pathlib import Path
 import discord
 from discord.ext import commands
 from collections import deque
@@ -77,6 +78,7 @@ class FunCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.recent = deque(maxlen=5)
+        self.dice_img_dir = (Path(__file__).resolve().parents[1] / "assets" / "dice").resolve()
 
     @commands.command(name="고민")
     async def 고민(self, ctx: commands.Context, *, 내용: str):
@@ -86,15 +88,42 @@ class FunCog(commands.Cog):
         await ctx.send(f"🪨 대답하는 돌멩이:\n {대답}")
 
     @commands.command(name="주사위")
-    async def 주사위(self, ctx: commands.Context):
+    async def roll_dice(self, ctx: commands.Context):
         outcomes = ["1", "2", "3", "4", "5", "6", "꽝", "999"]
         weights  = [16, 16, 16, 16, 16, 16,   2,   2]
         result = random.choices(outcomes, weights=weights, k=1)[0]
 
-        dice = ":game_die:"
+        # 결과별 파일명 매핑
+        filename_map = {
+            "1": "1.png",
+            "2": "2.png",
+            "3": "3.png",
+            "4": "4.png",
+            "5": "5.png",
+            "6": "6.png",
+            "꽝": "fail.png",
+            "999": "999.png",
+        }
+        fp = self.dice_img_dir / filename_map[result]
+
+        # 결과 메시지/색상
         if result in {"1", "2", "3", "4", "5", "6"}:
-            await ctx.send(f"{dice} 주사위 {result}!")
+            title = f":game_die: 주사위 {result}!"
+            color = discord.Color.blurple()
         elif result == "꽝":
-            await ctx.send(f"{dice}꽝~ 모솔 맘사위 당첨!")
+            title = ":game_die: 꽝~ 모솔 맘사위 당첨!"
+            color = discord.Color.red()
         else:  # "999"
-            await ctx.send(f"{dice}999!! 무적 밀사위 당첨~")
+            title = ":game_die: 999!! 무적 밀사위 당첨~"
+            color = discord.Color.gold()
+
+        embed = discord.Embed(title=title, color=color)
+
+        # 이미지가 있으면 첨부해서 Embed에 표시, 없으면 텍스트만
+        if fp.exists():
+            file = discord.File(fp, filename=fp.name)
+            embed.set_image(url=f"attachment://{fp.name}")
+            await ctx.send(embed=embed, file=file)
+        else:
+            # 이미지 누락 시 안전 폴백
+            await ctx.send(embed=embed)
