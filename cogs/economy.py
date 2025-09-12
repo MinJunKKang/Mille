@@ -32,6 +32,7 @@ def _get_id(section: str, key: str) -> int:
 # [Economy] 섹션에서 채널 ID 읽기
 VOICE_ANNOUNCE_CHANNEL_ID: int = _get_id("Economy", "voice_announce_channel_id")  # 랜덤 포인트 공지 채널
 ATTEND_CHANNEL_ID: int        = _get_id("Economy", "attend_channel_id")           # 출석 전용 채널
+PAY_LOG_CHANNEL_ID: int       = _get_id("Economy", "pay_log_channel_id")          # 지급-로그 채널
 
 
 class EconomyCog(commands.Cog):
@@ -82,6 +83,15 @@ class EconomyCog(commands.Cog):
                 return ch
         return None
 
+    def _get_pay_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """지급-로그 채널 반환 (ID가 없거나 권한 없으면 None)."""
+        if not guild or not PAY_LOG_CHANNEL_ID:
+            return None
+        ch = guild.get_channel(PAY_LOG_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+            return ch
+        return None
+
     def _check_channel(self, ctx: commands.Context, allowed_channel_id: int) -> bool:
         """특정 채널에서만 허용(allowed_channel_id==0 이면 제한 없음)."""
         if not ctx.guild or allowed_channel_id == 0:
@@ -130,6 +140,21 @@ class EconomyCog(commands.Cog):
         embed.set_footer(text="하루 1회 출석 가능")
         await ctx.send(embed=embed)
 
+        # ✅ 지급-로그 채널에 출석 보상 기록
+        log_ch = self._get_pay_log_channel(ctx.guild)
+        if log_ch:
+            log_embed = discord.Embed(
+                title="✅ 출석 보상 로그",
+                description=(
+                    f"**대상:** {ctx.author.mention}\n"
+                    f"**보상:** {format_num(DAILY_ATTEND_REWARD)} P\n"
+                    f"**채널:** {ctx.channel.mention}"
+                ),
+                color=discord.Color.green()
+            )
+            log_embed.add_field(name="대상 잔액", value=f"{format_num(rec['포인트'])} P", inline=True)
+            await log_ch.send(embed=log_embed)
+
     @commands.command(name="지갑")
     async def wallet(self, ctx: commands.Context, member: discord.Member | None = None):
         target = member or ctx.author
@@ -168,6 +193,20 @@ class EconomyCog(commands.Cog):
         embed.set_footer(text=f"지급자: {ctx.author.display_name}")
         await ctx.send(embed=embed)
 
+        # 지급-로그 채널에 기록
+        log_ch = self._get_pay_log_channel(ctx.guild)
+        if log_ch:
+            log_embed = discord.Embed(
+                title="🪙 지급 로그",
+                description=(f"**지급자:** {ctx.author.mention}\n"
+                             f"**대상:** {member.mention}\n"
+                             f"**금액:** {format_num(amount)} P\n"
+                             f"**채널:** {ctx.channel.mention}"),
+                color=discord.Color.blurple()
+            )
+            log_embed.add_field(name="대상 잔액", value=f"{format_num(rec['포인트'])} P", inline=True)
+            await log_ch.send(embed=log_embed)
+
     @commands.command(name="회수")
     async def revoke_points(self, ctx: commands.Context, member: discord.Member, amount: int):
         if not self._has_grant_power(ctx.author):
@@ -190,6 +229,20 @@ class EconomyCog(commands.Cog):
         )
         embed.set_footer(text=f"회수자: {ctx.author.display_name}")
         await ctx.send(embed=embed)
+
+        # 지급-로그 채널에 기록
+        log_ch = self._get_pay_log_channel(ctx.guild)
+        if log_ch:
+            log_embed = discord.Embed(
+                title="📉 회수 로그",
+                description=(f"**회수자:** {ctx.author.mention}\n"
+                             f"**대상:** {member.mention}\n"
+                             f"**금액:** {format_num(amount)} P\n"
+                             f"**채널:** {ctx.channel.mention}"),
+                color=discord.Color.red()
+            )
+            log_embed.add_field(name="대상 잔액", value=f"{format_num(current_points)} P", inline=True)
+            await log_ch.send(embed=log_embed)
 
     # --------- 송금 ---------
     @commands.command(name="송금", aliases=["이체", "보내기"])
@@ -231,6 +284,21 @@ class EconomyCog(commands.Cog):
         embed.add_field(name="보내는 분 잔액", value=f"{format_num(new_send)} P", inline=True)
         embed.add_field(name="받는 분 잔액", value=f"{format_num(new_recv)} P", inline=True)
         await ctx.send(embed=embed)
+
+        # 지급-로그 채널에 기록
+        log_ch = self._get_pay_log_channel(ctx.guild)
+        if log_ch:
+            log_embed = discord.Embed(
+                title="💸 송금 로그",
+                description=(f"**보낸 사람:** {sender.mention}\n"
+                             f"**받는 사람:** {receiver.mention}\n"
+                             f"**금액:** {format_num(amount)} P\n"
+                             f"**채널:** {ctx.channel.mention}"),
+                color=discord.Color.gold()
+            )
+            log_embed.add_field(name="보낸 사람 잔액", value=f"{format_num(new_send)} P", inline=True)
+            log_embed.add_field(name="받는 사람 잔액", value=f"{format_num(new_recv)} P", inline=True)
+            await log_ch.send(embed=log_embed)
 
     @transfer_points.error
     async def _transfer_error(self, ctx: commands.Context, error: Exception):
