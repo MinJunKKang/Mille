@@ -4,6 +4,7 @@ import random
 import re
 import urllib.parse
 import json
+import configparser
 import discord
 from discord.ext import commands
 from discord.ui import View, Button, Select, Modal, TextInput
@@ -11,8 +12,23 @@ from typing import Dict, Set, List, Optional, Tuple
 
 from utils.stats import update_result_dual, MANG_PATH  # 승/패 기록 반영
 
-# 내전 기록 채널(텍스트 채널) ID
-MATCH_LOG_CHANNEL_ID = 1409174709718880329
+# ───────── config.ini 로딩 ─────────
+_cfg = configparser.ConfigParser()
+try:
+    _cfg.read("config.ini", encoding="utf-8")
+except Exception:
+    pass
+
+def _get_id(section: str, key: str) -> int:
+    """config.ini에서 정수 ID 읽기 (없거나 잘못되면 0)."""
+    try:
+        val = _cfg.get(section, key, fallback="0")
+        return int(val) if str(val).isdigit() else 0
+    except Exception:
+        return 0
+
+# [Match] 섹션에서 내전 기록 채널 ID 읽기 (0이면 폴백 사용)
+MATCH_LOG_CHANNEL_ID: int = _get_id("Match", "match_log_channel_id")
 
 # ===== 도우미 함수 =====
 def create_opgg_multisearch_url(summoner_list: List[str]) -> str:
@@ -72,10 +88,14 @@ class MatchCog(commands.Cog):
         self.active_hosts: Set[int] = set()
 
     def _get_match_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """내전 기록을 보낼 텍스트 채널을 찾는다."""
-        ch = guild.get_channel(MATCH_LOG_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
-            return ch
+        """내전 기록을 보낼 텍스트 채널을 찾는다.
+        1) config.ini의 MATCH_LOG_CHANNEL_ID (0이면 건너뜀)
+        2) 봇이 보낼 수 있는 첫 텍스트 채널
+        """
+        if MATCH_LOG_CHANNEL_ID:
+            ch = guild.get_channel(MATCH_LOG_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+                return ch
         # 폴백: 봇이 보낼 수 있는 첫 텍스트 채널
         for c in guild.text_channels:
             if c.permissions_for(guild.me).send_messages:
@@ -314,6 +334,7 @@ class MatchCog(commands.Cog):
         opgg_view = self.OpggButtonView(opgg1, opgg2)
         await channel.send(view=opgg_view)
 
+        # 기록 채널에도 팀 구성 결과 전송
         log_ch = self._get_match_log_channel(guild)
         if log_ch:
             host_member = guild.get_member(game.host_id)
