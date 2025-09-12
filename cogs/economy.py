@@ -1,6 +1,7 @@
 # cogs/economy.py
 import random
 import discord
+import configparser
 from discord.ext import commands, tasks
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,8 +14,24 @@ from utils.stats import (
 
 DAILY_ATTEND_REWARD = 1500
 
-# 1순위: 공지 기본 채널 ID
-DEFAULT_VOICE_ANNOUNCE_CHANNEL_ID = 1409174709416759420
+# ───────── config.ini 로딩 ─────────
+_cfg = configparser.ConfigParser()
+try:
+    _cfg.read("config.ini", encoding="utf-8")
+except Exception:
+    pass
+
+def _get_id(section: str, key: str) -> int:
+    """config.ini에서 정수 ID 읽기 (없거나 잘못되면 0)."""
+    try:
+        val = _cfg.get(section, key, fallback="0")
+        return int(val) if str(val).isdigit() else 0
+    except Exception:
+        return 0
+
+# [Economy] 섹션에서 채널 ID 읽기
+VOICE_ANNOUNCE_CHANNEL_ID: int = _get_id("Economy", "voice_announce_channel_id")  # 랜덤 포인트 공지 채널
+ATTEND_CHANNEL_ID: int        = _get_id("Economy", "attend_channel_id")           # 출석 전용 채널
 
 
 class EconomyCog(commands.Cog):
@@ -51,23 +68,37 @@ class EconomyCog(commands.Cog):
 
     def _get_announce_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         """공지 채널 선택:
-        1) DEFAULT_VOICE_ANNOUNCE_CHANNEL_ID
+        1) config.ini의 VOICE_ANNOUNCE_CHANNEL_ID
         2) 봇이 send_messages 권한이 있는 첫 텍스트 채널
         """
-        # 1) 고정 ID 우선
-        ch = guild.get_channel(DEFAULT_VOICE_ANNOUNCE_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
-            return ch
+        if VOICE_ANNOUNCE_CHANNEL_ID:
+            ch = guild.get_channel(VOICE_ANNOUNCE_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+                return ch
 
-        # 2) 첫 사용 가능 텍스트 채널
+        # 폴백: 첫 사용 가능 텍스트 채널
         for ch in guild.text_channels:
             if ch.permissions_for(guild.me).send_messages:
                 return ch
         return None
 
+    def _check_channel(self, ctx: commands.Context, allowed_channel_id: int) -> bool:
+        """특정 채널에서만 허용(allowed_channel_id==0 이면 제한 없음)."""
+        if not ctx.guild or allowed_channel_id == 0:
+            return True
+        return ctx.channel.id == allowed_channel_id
+
+    def _mention(self, channel_id: int) -> str:
+        return f"<#{channel_id}>" if channel_id else "지정 채널(관리자 설정 필요)"
+
     # --------- 출석/지갑/지급/회수 ---------
     @commands.command(name="출석")
     async def attend(self, ctx: commands.Context):
+        # 채널 제한: ATTEND_CHANNEL_ID가 설정돼 있으면 해당 채널에서만 허용
+        if not self._check_channel(ctx, ATTEND_CHANNEL_ID):
+            await ctx.reply(f"이 명령은 {self._mention(ATTEND_CHANNEL_ID)} 에서만 사용할 수 있어요.", delete_after=5)
+            return
+
         stats = load_stats()
         uid = str(ctx.author.id)
         rec = ensure_user(stats, uid)
@@ -159,6 +190,53 @@ class EconomyCog(commands.Cog):
         )
         embed.set_footer(text=f"회수자: {ctx.author.display_name}")
         await ctx.send(embed=embed)
+
+    # --------- 송금 ---------
+    @commands.command(name="송금", aliases=["이체", "보내기"])
+    async def transfer_points(self, ctx: commands.Context, member: discord.Member, amount: int):
+        """
+        사용법: !송금 @대상 금액
+        - 본인 → 대상에게 포인트를 이체합니다.
+        - 금액은 1 이상 정수.
+        """
+        sender = ctx.author
+        receiver = member
+
+        # 기본 검증
+        if receiver.bot:
+            await ctx.reply("봇에게는 송금할 수 없어요.", delete_after=5)
+            return
+        if receiver.id == sender.id:
+            await ctx.reply("자기 자신에게는 송금할 수 없어요.", delete_after=5)
+            return
+        if amount <= 0:
+            await ctx.reply("송금 금액은 1 이상이어야 합니다.", delete_after=5)
+            return
+
+        # 차감 → 실패 시 잔액 부족
+        if not spend_points(sender.id, amount):
+            await ctx.reply(f"잔액이 부족합니다. (보유: {format_num(get_points(sender.id))} P)", delete_after=7)
+            return
+
+        # 입금
+        new_recv = add_points(receiver.id, amount)
+        new_send = get_points(sender.id)
+
+        embed = discord.Embed(
+            title="💸 포인트 송금 완료",
+            description=(f"{sender.mention} → {receiver.mention}\n"
+                         f"송금액: **{format_num(amount)} P**"),
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="보내는 분 잔액", value=f"{format_num(new_send)} P", inline=True)
+        embed.add_field(name="받는 분 잔액", value=f"{format_num(new_recv)} P", inline=True)
+        await ctx.send(embed=embed)
+
+    @transfer_points.error
+    async def _transfer_error(self, ctx: commands.Context, error: Exception):
+        if isinstance(error, commands.MissingRequiredArgument) or isinstance(error, commands.BadArgument):
+            await ctx.reply("사용법: `!송금 @대상 금액` (예: `!송금 @아무개 5000`)", delete_after=8)
+
     # --------- 보이스 랜덤: 수동 실행 (관리자 전용) ---------
     @commands.guild_only()
     @commands.has_guild_permissions(administrator=True)
@@ -179,14 +257,21 @@ class EconomyCog(commands.Cog):
         new_balance = add_points(winner.id, amount)
 
         embed = discord.Embed(
-            title="🎉 랜덤 지급",
+            title="🎉 보이스 랜덤 지급",
             description=(f"{vch.mention} 에서 랜덤 추첨!\n"
                          f"당첨자: {winner.mention}\n"
                          f"지급액: **{format_num(amount)} P**\n"
                          f"현재 보유 포인트: **{format_num(new_balance)} P**"),
             color=discord.Color.gold()
         )
-        await ctx.send(embed=embed)
+
+        # 결과는 공지 채널로 전송
+        ch = self._get_announce_channel(guild)
+        if ch:
+            await ch.send(embed=embed)
+        else:
+            # 폴백: 현재 채널
+            await ctx.send(embed=embed)
 
     @random_voice_grant.error
     async def _rv_error(self, ctx: commands.Context, error: Exception):
@@ -214,7 +299,7 @@ class EconomyCog(commands.Cog):
                     continue
 
                 embed = discord.Embed(
-                    title="🎉 랜덤 지급",
+                    title="🎉 보이스 랜덤 지급",
                     description=(f"{vch.mention} 에서 랜덤 추첨!\n"
                                  f"당첨자: {winner.mention}\n"
                                  f"지급액: **{format_num(self.voice_grant_amount)} P**\n"
