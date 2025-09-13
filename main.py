@@ -1,4 +1,3 @@
-# main.py
 import discord
 from discord.ext import commands
 import os, configparser
@@ -12,38 +11,46 @@ from cogs.fun_cog import FunCog
 from cogs.moderation_cog import ModerationCog
 from cogs.gamble_cog import GambleCog
 
-# from 포켓몬8 import subtract_points_from_user, save_user_data, get_user_points, place_bet, process_betting_result
-
+# ───── config.ini 로딩 ─────
 config = configparser.ConfigParser()
 config.read("config.ini", encoding="utf-8")
+
+def _get_id(section: str, key: str) -> int:
+    try:
+        v = config.get(section, key, fallback="0")
+        return int(v) if str(v).isdigit() else 0
+    except Exception:
+        return 0
+
 TOKEN = os.getenv("DISCORD_TOKEN") or config.get("Settings", "token", fallback="").strip()
 
-# 역할 ID (내전)
+# ───── 역할 ID: config.ini에서 로드 ─────
 ROLE_IDS = {
-    "사서": 1409174707307151418,
-    "수석사서": 1409174707307151419,
-    "큐레이터": 1409174707307151416,
-    "관장": 1409174707315544064,
-    "내전": 1409174707315544065,
+    "사서":     _get_id("Roles", "사서"),
+    "수석사서": _get_id("Roles", "수석사서"),
+    "큐레이터": _get_id("Roles", "큐레이터"),
+    "관장":     _get_id("Roles", "관장"),
+    "내전":     _get_id("Roles", "내전"),
 }
 
-CLEANUP_ROLE_IDS = {k: ROLE_IDS[k] for k in ("사서", "수석사서", "큐레이터", "관장")}
- 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def setup_hook():
+    # 내전/모더/이코노미 등 모두 동일 ROLE_IDS 전달
     await bot.add_cog(MatchCog(bot, role_ids=ROLE_IDS))
-    await bot.add_cog(EconomyCog(bot, grant_role_ids={k:v for k,v in ROLE_IDS.items() if k!="내전"}))
+    await bot.add_cog(
+        EconomyCog(
+            bot,
+            grant_role_ids={k: v for k, v in ROLE_IDS.items() if k != "내전"},
+            curator_role_id=ROLE_IDS.get("큐레이터"),
+        )
+    )
     await bot.add_cog(StatsCog(bot))
     await bot.add_cog(FunCog(bot))
     await bot.add_cog(ModerationCog(bot, role_ids=ROLE_IDS))
     await bot.add_cog(GambleCog(bot))
-
-game_counter = 1
-games = {}  
-active_hosts = set()  
 
 @bot.event
 async def on_ready():
