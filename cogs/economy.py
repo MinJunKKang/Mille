@@ -38,9 +38,15 @@ PAY_LOG_CHANNEL_ID: int       = _get_id("Economy", "pay_log_channel_id")        
 class EconomyCog(commands.Cog):
     """포인트/출석/지갑/지급/회수/보이스랜덤(스케줄)"""
 
-    def __init__(self, bot: commands.Bot, grant_role_ids: Optional[Dict[str, int]] = None):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        grant_role_ids: Optional[Dict[str, int]] = None,
+        curator_role_id: Optional[int] = None,
+    ):
         self.bot = bot
         self.grant_role_ids: Set[int] = set(grant_role_ids.values()) if grant_role_ids else set()
+        self.curator_role_id: Optional[int] = int(curator_role_id) if curator_role_id else None 
 
         # 보이스 랜덤 스케줄 상태
         self.voice_grant_enabled: bool = True
@@ -53,6 +59,12 @@ class EconomyCog(commands.Cog):
     def _has_grant_power(self, member: discord.Member) -> bool:
         role_ids = {r.id for r in member.roles}
         return bool(role_ids & self.grant_role_ids) or member.guild_permissions.administrator
+    
+    def _is_curator(self, member: discord.Member) -> bool:
+        return bool(
+            self.curator_role_id
+            and any(r.id == self.curator_role_id for r in member.roles)
+        )
 
     def _pick_voice_candidates(self, guild: discord.Guild):
         """AFK/봇 제외하고 음성/스테이지 채널 참여자 수집"""
@@ -405,9 +417,11 @@ class EconomyCog(commands.Cog):
         if isinstance(error, commands.MissingPermissions):
             await ctx.reply("이 명령은 **관리자만** 사용할 수 있어요.", delete_after=5)
 
-    @commands.has_guild_permissions(administrator=True)
     @commands.command(name="보이스랜덤-금액")
     async def voice_random_amount(self, ctx: commands.Context, amount: int):
+        if not self._is_curator(ctx.author):  # <-- 큐레이터 체크
+            await ctx.reply("이 명령은 **큐레이터만** 사용할 수 있어요.", delete_after=5)
+            return
         if amount <= 0:
             await ctx.reply("금액은 1 이상이어야 합니다.", delete_after=5)
             return
@@ -416,8 +430,9 @@ class EconomyCog(commands.Cog):
 
     @voice_random_amount.error
     async def _amount_error(self, ctx: commands.Context, error: Exception):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.reply("이 명령은 **관리자만** 사용할 수 있어요.", delete_after=5)
+        if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+            await ctx.reply("사용법: `!보이스랜덤-금액 1500` (정수 입력)", delete_after=7)
+
 
 
 async def setup(bot: commands.Bot):
