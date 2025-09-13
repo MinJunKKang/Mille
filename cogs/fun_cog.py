@@ -78,7 +78,7 @@ class FunCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.recent = deque(maxlen=5)
-        self.dice_img_dir = (Path(__file__).resolve().parents[1] / "assets" / "dice").resolve()
+        self.dice_img_dir = (Path(__file__).resolve().parents[1] / "assets").resolve()
 
     @commands.command(name="고민")
     async def 고민(self, ctx: commands.Context, *, 내용: str):
@@ -108,7 +108,7 @@ class FunCog(commands.Cog):
 
         # 결과 메시지/색상
         if result in {"1", "2", "3", "4", "5", "6"}:
-            title = f":game_die: 주사위 {result}!"
+            title = f":game_die: 주사위 {result}"
             color = discord.Color.blurple()
         elif result == "꽝":
             title = ":game_die: 꽝~ 모솔 맘사위 당첨!"
