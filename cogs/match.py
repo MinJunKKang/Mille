@@ -10,7 +10,7 @@ from discord.ext import commands
 from discord.ui import View, Button, Select, Modal, TextInput
 from typing import Dict, Set, List, Optional, Tuple
 
-from utils.stats import update_result_dual, MANG_PATH  # 승/패 기록 반영
+from utils.stats import update_result_dual, MANG_PATH, get_points, spend_points, add_points
 
 # ───────── config.ini 로딩 ─────────
 _cfg = configparser.ConfigParser()
@@ -27,8 +27,9 @@ def _get_id(section: str, key: str) -> int:
     except Exception:
         return 0
 
-# [Match] 섹션에서 내전 기록 채널 ID 읽기 (0이면 폴백 사용)
+# 설정 값들 읽기
 MATCH_LOG_CHANNEL_ID: int = _get_id("Match", "match_log_channel_id")
+MATCH_JOIN_LEAVE_LOG_CHANNEL_ID: int = _get_id("Match", "match_join_leave_log_channel_id")  # 새로 추가
 
 # ===== 도우미 함수 =====
 def create_opgg_multisearch_url(summoner_list: List[str]) -> str:
@@ -55,10 +56,12 @@ class Game:
         self.pick_order: List[int] = []
         self.draft_turn = 0
         self.finished = False
+        self.result_recorded = False  # 결과 기록 여부 추가
         self.result_message: Optional[discord.Message] = None
         self.team_status_message: Optional[discord.Message] = None
         self.bets: Dict[int, Dict[str, int]] = {}
-        self.pick_history: List[Tuple[int, int]] = []  # (team_num, user_id)
+        self.pick_history: List[Tuple[int, int]] = []
+        self.betting_active = True  # 배팅 활성화 상태 추가
 
     def is_full(self) -> bool:
         return len(self.participants) >= self.max_players
@@ -75,6 +78,10 @@ class Game:
             return True
         return False
 
+    def disable_betting(self):
+        """배팅을 비활성화"""
+        self.betting_active = False
+
 
 # ====== Cog ======
 class MatchCog(commands.Cog):
@@ -88,18 +95,23 @@ class MatchCog(commands.Cog):
         self.active_hosts: Set[int] = set()
 
     def _get_match_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """내전 기록을 보낼 텍스트 채널을 찾는다.
-        1) config.ini의 MATCH_LOG_CHANNEL_ID (0이면 건너뜀)
-        2) 봇이 보낼 수 있는 첫 텍스트 채널
-        """
+        """내전 기록을 보낼 텍스트 채널을 찾는다."""
         if MATCH_LOG_CHANNEL_ID:
             ch = guild.get_channel(MATCH_LOG_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
                 return ch
-        # 폴백: 봇이 보낼 수 있는 첫 텍스트 채널
         for c in guild.text_channels:
             if c.permissions_for(guild.me).send_messages:
                 return c
+        return None
+
+    def _get_join_leave_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """내전 참여/취소 로그를 보낼 텍스트 채널을 찾는다."""
+        if MATCH_JOIN_LEAVE_LOG_CHANNEL_ID:
+            ch = guild.get_channel(MATCH_JOIN_LEAVE_LOG_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
+                return ch
+        # config.ini에 설정이 없으면 로그를 보내지 않음
         return None
 
     # --------- 내부 유틸 ---------
@@ -235,24 +247,17 @@ class MatchCog(commands.Cog):
                     await interaction.response.send_message("이미 선택된 유저입니다.", ephemeral=True)
                     return
 
-                # 선택 반영
                 game.teams[team_num].append(uid)
                 available.remove(uid)
-
-                # 히스토리 기록 (되돌리기용)
                 game.pick_history.append((team_num, uid))
-
-                # 턴 진행
                 game.draft_turn += 1
 
-                # 팀 현황 갱신 + 현재 선택 UI 삭제 후 다음 UI 띄우기
                 await game.team_status_message.edit(embed=create_team_embed())
                 await interaction.message.delete()
                 await cog.send_draft_ui(channel, game, available)
 
             @discord.ui.button(label="↩ 되돌리기", style=discord.ButtonStyle.secondary)
             async def undo_pick(self, interaction: discord.Interaction, button: Button):
-                # 권한: 개최자 또는 관리자만
                 if interaction.user.id != game.host_id and not interaction.user.guild_permissions.manage_guild:
                     await interaction.response.send_message("되돌리기는 개최자 또는 관리자만 가능합니다.", ephemeral=True)
                     return
@@ -261,25 +266,19 @@ class MatchCog(commands.Cog):
                     await interaction.response.send_message("되돌릴 선택이 없습니다.", ephemeral=True)
                     return
 
-                # 마지막 픽 되돌리기
                 last_team, last_uid = game.pick_history.pop()
 
-                # 팀에서 제거
                 if last_uid in game.teams[last_team]:
                     game.teams[last_team].remove(last_uid)
 
-                # 다시 선택 가능 목록에 복귀
                 if last_uid not in available:
                     available.append(last_uid)
 
-                # 턴 되돌리기
                 if game.draft_turn > 0:
                     game.draft_turn -= 1
 
-                # 팀 현황 갱신
                 await game.team_status_message.edit(embed=create_team_embed())
 
-                # 현재 선택 UI 교체
                 try:
                     await interaction.message.delete()
                 except:
@@ -349,7 +348,6 @@ class MatchCog(commands.Cog):
             log_embed.add_field(name="🟥 2팀", value=t2 or "- 없음", inline=True)
             log_embed.set_footer(text="아래 버튼으로 전적 확인")
 
-            # 기록방에도 OPGG 버튼 함께 전송
             await log_ch.send(embed=log_embed, view=self.OpggButtonView(opgg1, opgg2))
 
         asyncio.create_task(self.disable_buttons_after_timeout(result_message, result_view, 10800))
@@ -358,7 +356,6 @@ class MatchCog(commands.Cog):
     async def disable_buttons_after_timeout(self, message: discord.Message, view: View, seconds: int):
         await asyncio.sleep(seconds)
 
-        # 이미 종료된 경우 무시
         if hasattr(view, "game") and getattr(view.game, "finished", False):
             return
 
@@ -372,6 +369,52 @@ class MatchCog(commands.Cog):
             await message.edit(embed=embed, view=view)
         except:
             pass
+
+    def calculate_betting_results(self, game: Game, winning_team: int) -> str:
+        """배당 결과 계산"""
+        if not game.bets:
+            return "배당 결과가 없습니다."
+        
+        team1_bets = sum(bet["amount"] for bet in game.bets.values() if bet["team"] == 1)
+        team2_bets = sum(bet["amount"] for bet in game.bets.values() if bet["team"] == 2)
+        total_bets = team1_bets + team2_bets
+        
+        if total_bets == 0:
+            return "배당 결과가 없습니다."
+        
+        winners = [uid for uid, bet in game.bets.items() if bet["team"] == winning_team]
+        losers = [uid for uid, bet in game.bets.items() if bet["team"] != winning_team]
+        
+        winning_total = team1_bets if winning_team == 1 else team2_bets
+        losing_total = team2_bets if winning_team == 1 else team1_bets
+        
+        result_text = f"🏆 {winning_team}팀 승리!\n"
+        result_text += f"총 배팅금: {total_bets:,}₽\n\n"
+        
+        if winners:
+            result_text += "🎉 **당첨자들:**\n"
+            for winner_id in winners:
+                bet = game.bets[winner_id]
+                bet_amount = bet["amount"]
+                
+                # 배당률 계산: (총 배팅금 / 승리팀 배팅금)
+                if winning_total > 0:
+                    multiplier = total_bets / winning_total
+                    winnings = int(bet_amount * multiplier)
+                    profit = winnings - bet_amount
+                    
+                    # 포인트 지급
+                    add_points(winner_id, winnings)
+                    
+                    result_text += f"<@{winner_id}>: {bet_amount:,}₽ → {winnings:,}₽ (+{profit:,}₽)\n"
+        
+        if losers:
+            result_text += "\n💸 **낙첨자들:**\n"
+            for loser_id in losers:
+                bet_amount = game.bets[loser_id]["amount"]
+                result_text += f"<@{loser_id}>: -{bet_amount:,}₽\n"
+        
+        return result_text
 
     # ========= 스크림 =========
     @commands.command(name="스크림", aliases=["스크림전적"])
@@ -431,7 +474,6 @@ class MatchCog(commands.Cog):
 
         view = self.LobbyView(self, game)
 
-        # 역할 멘션
         role_id = self.role_ids.get("내전")
         role = ctx.guild.get_role(role_id) if role_id else None
         if role is None:
@@ -479,6 +521,11 @@ class MatchCog(commands.Cog):
 
             user_id = interaction.user.id
             if self.game.add_participant(user_id):
+                # 참여 로그 전송
+                log_ch = self.cog._get_join_leave_log_channel(interaction.guild)
+                if log_ch:
+                    await log_ch.send(f"👋 `{interaction.user.display_name}`님이 내전 #{self.game.id}에 참여했습니다.")
+                
                 await self.update_message()
 
                 if self.game.is_full():
@@ -510,15 +557,13 @@ class MatchCog(commands.Cog):
         async def cancel(self, interaction: discord.Interaction, button: Button):
             user_id = interaction.user.id
             if self.game.remove_participant(user_id):
+                # 참여 취소 로그 전송
+                log_ch = self.cog._get_join_leave_log_channel(interaction.guild)
+                if log_ch:
+                    await log_ch.send(f"🚪 `{interaction.user.display_name}`님이 내전 #{self.game.id}에서 참여를 취소했습니다.")
+                
                 await self.update_message()
                 await interaction.response.defer()
-
-                log_channel = interaction.guild.get_channel(1367420842350219356)
-                if log_channel:
-                    member = interaction.user
-                    await log_channel.send(
-                        f"🚪 `{member.display_name}`님이 내전 #{self.game.id}에서 참여를 취소했습니다."
-                    )
             else:
                 if user_id == self.game.host_id:
                     await interaction.response.send_message("개최자는 참여를 취소할 수 없습니다.", ephemeral=True)
@@ -545,7 +590,9 @@ class MatchCog(commands.Cog):
             super().__init__(timeout=None)
             self.cog = cog
             self.game = game
+            # 10명이 모인 후에도 참여 취소 가능하도록 버튼 추가
             self.add_item(Button(label="시작", style=discord.ButtonStyle.primary, custom_id="start"))
+            self.add_item(Button(label="취소", style=discord.ButtonStyle.secondary, custom_id="cancel"))  # 추가
             self.add_item(Button(label="종료", style=discord.ButtonStyle.danger, custom_id="end"))
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -558,6 +605,30 @@ class MatchCog(commands.Cog):
                 embed = discord.Embed(title="팀장 선택", description="팀장 선택을 시작합니다!", color=0x2F3136)
                 await interaction.response.edit_message(embed=embed, view=None)
                 await self.cog.start_team_leader_selection(interaction, self.game)
+                return True
+
+            elif interaction.data["custom_id"] == "cancel":
+                # 10명이 모인 후에도 참여 취소 가능
+                user_id = interaction.user.id
+                if self.game.remove_participant(user_id):
+                    # 참여 취소 로그 전송
+                    log_ch = self.cog._get_join_leave_log_channel(interaction.guild)
+                    if log_ch:
+                        await log_ch.send(f"🚪 `{interaction.user.display_name}`님이 내전 #{self.game.id}에서 참여를 취소했습니다.")
+                    
+                    # 10명 미만이 되면 다시 LobbyView로 돌아감
+                    if not self.game.is_full():
+                        self.clear_items()
+                        lobby_view = self.cog.LobbyView(self.cog, self.game)
+                        await lobby_view.update_message()
+                        await interaction.response.edit_message(view=lobby_view)
+                    else:
+                        await interaction.response.defer()
+                else:
+                    if user_id == self.game.host_id:
+                        await interaction.response.send_message("개최자는 참여를 취소할 수 없습니다.", ephemeral=True)
+                    else:
+                        await interaction.response.send_message("참여 중이 아닙니다.", ephemeral=True)
                 return True
 
             elif interaction.data["custom_id"] == "end":
@@ -586,10 +657,16 @@ class MatchCog(commands.Cog):
 
         @discord.ui.button(label="1팀에 배팅", style=discord.ButtonStyle.success)
         async def bet_team1(self, interaction: discord.Interaction, button: Button):
+            if not self.game.betting_active:
+                await interaction.response.send_message("❌ 현재 배팅이 비활성화되었습니다.", ephemeral=True)
+                return
             await self.handle_bet(interaction, team=1)
 
         @discord.ui.button(label="2팀에 배팅", style=discord.ButtonStyle.success)
         async def bet_team2(self, interaction: discord.Interaction, button: Button):
+            if not self.game.betting_active:
+                await interaction.response.send_message("❌ 현재 배팅이 비활성화되었습니다.", ephemeral=True)
+                return
             await self.handle_bet(interaction, team=2)
 
         async def handle_bet(self, interaction: discord.Interaction, team: int):
@@ -618,6 +695,11 @@ class MatchCog(commands.Cog):
                         await modal_interaction.response.send_message("❌ 이미 배팅하셨습니다.", ephemeral=True)
                         return
 
+                    # 포인트 확인 및 차감
+                    if not spend_points(user_id, amount_int):
+                        await modal_interaction.response.send_message("❌ 포인트가 부족합니다.", ephemeral=True)
+                        return
+
                     self.game.bets[user_id] = {"amount": amount_int, "team": self.team}
                     await modal_interaction.response.send_message(
                         f"✅ {modal_interaction.user.mention}님이 {self.team}팀에 {amount_int}₽ 배팅했습니다.",
@@ -641,6 +723,9 @@ class MatchCog(commands.Cog):
                 await interaction.response.send_message("이미 결과가 기록되었습니다.", ephemeral=True)
                 return
 
+            # 배팅 비활성화
+            self.game.disable_betting()
+
             uids_team1 = list(set([self.game.team_captains[0]] + self.game.teams[1]))
             uids_team2 = list(set([self.game.team_captains[1]] + self.game.teams[2]))
 
@@ -649,7 +734,11 @@ class MatchCog(commands.Cog):
             for uid in uids_team2:
                 update_result_dual(str(uid), False)
 
+            # 배당 결과 계산
+            betting_result = self.cog.calculate_betting_results(self.game, 1)
+
             self.game.finished = True
+            self.game.result_recorded = True
             self.team1_win.disabled = True
             self.team2_win.disabled = True
             self.cancel_game.disabled = True
@@ -659,7 +748,7 @@ class MatchCog(commands.Cog):
 
             embed = interaction.message.embeds[0]
             embed.add_field(name="결과", value="✅ 1팀 승리!", inline=False)
-            embed.add_field(name="💸 배당 결과", value="배당 결과가 없습니다.", inline=False)
+            embed.add_field(name="💸 배당 결과", value=betting_result, inline=False)
             await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="2팀 승리", style=discord.ButtonStyle.danger)
@@ -671,6 +760,9 @@ class MatchCog(commands.Cog):
                 await interaction.response.send_message("이미 결과가 기록되었습니다.", ephemeral=True)
                 return
 
+            # 배팅 비활성화
+            self.game.disable_betting()
+
             uids_team1 = list(set([self.game.team_captains[0]] + self.game.teams[1]))
             uids_team2 = list(set([self.game.team_captains[1]] + self.game.teams[2]))
 
@@ -679,7 +771,11 @@ class MatchCog(commands.Cog):
             for uid in uids_team2:
                 update_result_dual(str(uid), True)
 
+            # 배당 결과 계산
+            betting_result = self.cog.calculate_betting_results(self.game, 2)
+
             self.game.finished = True
+            self.game.result_recorded = True
             self.team1_win.disabled = True
             self.team2_win.disabled = True
             self.cancel_game.disabled = True
@@ -689,7 +785,7 @@ class MatchCog(commands.Cog):
 
             embed = interaction.message.embeds[0]
             embed.add_field(name="결과", value="✅ 2팀 승리!", inline=False)
-            embed.add_field(name="💸 배당 결과", value="배당 결과가 없습니다.", inline=False)
+            embed.add_field(name="💸 배당 결과", value=betting_result, inline=False)
             await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
@@ -701,13 +797,20 @@ class MatchCog(commands.Cog):
                 await interaction.response.send_message("이미 결과가 기록되었습니다.", ephemeral=True)
                 return
 
+            # 배팅 환불
+            for user_id, bet in self.game.bets.items():
+                add_points(user_id, bet["amount"])
+
+            # 배팅 비활성화
+            self.game.disable_betting()
+
             self.game.finished = True
             self.team1_win.disabled = True
             self.team2_win.disabled = True
             self.cancel_game.disabled = True
 
             embed = interaction.message.embeds[0]
-            embed.add_field(name="결과", value="❌ 게임이 취소되었습니다. 결과는 기록되지 않습니다.", inline=False)
+            embed.add_field(name="결과", value="❌ 게임이 취소되었습니다. 배팅 금액이 환불되었습니다.", inline=False)
             await interaction.response.edit_message(embed=embed, view=self)
 
     class PlayAgainButton(Button):
