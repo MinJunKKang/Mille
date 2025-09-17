@@ -340,8 +340,7 @@ class EconomyCog(commands.Cog):
             title="🎉 보이스 랜덤 지급",
             description=(f"{vch.mention} 에서 랜덤 추첨!\n"
                          f"당첨자: {winner.mention}\n"
-                         f"지급액: **{format_num(amount)} P**\n"
-                         f"현재 보유 포인트: **{format_num(new_balance)} P**"),
+                         f"지급액: **{format_num(amount)} P**\n"),
             color=discord.Color.gold()
         )
 
