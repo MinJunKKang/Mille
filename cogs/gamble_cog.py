@@ -41,19 +41,52 @@ ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 GRAPH_IMG_NAME = "graph.png"        # assets/graph.png 로 넣어두세요
 GRAPH_IMG_PATH = ASSETS_DIR / GRAPH_IMG_NAME
 
+import random
+
 def roll_crash_point():
-    """크래시 지점 샘플링(운영자 이득 쪽으로 기울어진 분포)"""
-    r = random.random()
-    if r < 0.08:      # 8% → 1.0x 즉시 터짐
-        return 1.0
-    elif r < 0.50:    # 42% → 1.0~1.5배
-        return round(random.uniform(1.0, 1.5), 2)
-    elif r < 0.85:    # 35% → 1.5~3배
-        return round(random.uniform(1.5, 3.0), 2)
-    elif r < 0.98:    # 13% → 3~10배
-        return round(random.uniform(3.0, 10.0), 2)
-    else:             # 2% → 10~30배 
-        return round(random.uniform(10.0, 30.0), 2)
+    """
+    크래시 지점 샘플링 (요청한 구간/확률 반영, 총합 101% -> 정규화하여 사용)
+      0.51~1.00 : 2%
+      1.10~1.30 : 38%
+      1.31~1.50 : 25%
+      1.51~1.75 : 12%
+      1.76~2.00 : 7%
+      2.01~2.30 : 5%
+      2.31~2.50 : 3%
+      2.51~3.00 : 2%
+      3.01~4.00 : 2%
+      4.01~5.00 : 2%
+      5.00~10.00: 1.5%
+      10.00~15.00: 1%
+      16.00~30.00: 0.5%
+    """
+    buckets = [
+        (0.51, 1.00,  2.0),
+        (1.10, 1.30, 38.0),
+        (1.31, 1.50, 25.0),
+        (1.51, 1.75, 12.0),
+        (1.76, 2.00,  7.0),
+        (2.01, 2.30,  5.0),
+        (2.31, 2.50,  3.0),
+        (2.51, 3.00,  2.0),
+        (3.01, 4.00,  2.0),
+        (4.01, 5.00,  2.0),
+        (5.00,10.00,  1.5),
+        (10.00,15.00, 1.0),
+        (16.00,30.00, 0.5),
+    ]
+    total = sum(w for _, _, w in buckets)  # 101.0
+    # 정규화된 가중치로 1회 샘플
+    pick = random.random() * total
+    acc = 0.0
+    for lo, hi, w in buckets:
+        acc += w
+        if pick < acc:
+            return round(random.uniform(lo, hi), 2)
+    # 이론상 도달 X, 안전망
+    lo, hi, _ = buckets[-1]
+    return round(random.uniform(lo, hi), 2)
+
 
 class GambleCog(commands.Cog):
     """버튼 도박: !도박1, 그래프 도박: !도박2, 가위바위보 도박: !도박3"""
@@ -360,7 +393,7 @@ class GambleCog(commands.Cog):
         outer_self = self
 
         crash_at = roll_crash_point()
-        multiplier = 1.00
+        multiplier = 0.50
         cashed_out = False
         cashed_amount = 0
 
