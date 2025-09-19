@@ -389,10 +389,10 @@ class MatchCog(commands.Cog):
         losing_total = team2_bets if winning_team == 1 else team1_bets
         
         result_text = f"🏆 {winning_team}팀 승리!\n"
-        result_text += f"총 배팅금: {total_bets:,}₽\n\n"
+        result_text += f"총 배팅금: {total_bets:,}P\n\n"
         
         if winners:
-            result_text += "🎉 **당첨자들:**\n"
+            result_text += "🎉 **당첨자**\n"
             for winner_id in winners:
                 bet = game.bets[winner_id]
                 bet_amount = bet["amount"]
@@ -406,13 +406,13 @@ class MatchCog(commands.Cog):
                     # 포인트 지급
                     add_points(winner_id, winnings)
                     
-                    result_text += f"<@{winner_id}>: {bet_amount:,}₽ → {winnings:,}₽ (+{profit:,}₽)\n"
+                    result_text += f"<@{winner_id}>: {bet_amount:,}P → {winnings:,}P (+{profit:,}P)\n"
         
         if losers:
-            result_text += "\n💸 **낙첨자들:**\n"
+            result_text += "\n💸 **낙첨자**\n"
             for loser_id in losers:
                 bet_amount = game.bets[loser_id]["amount"]
-                result_text += f"<@{loser_id}>: -{bet_amount:,}₽\n"
+                result_text += f"<@{loser_id}>: -{bet_amount:,}P\n"
         
         return result_text
 
@@ -673,7 +673,7 @@ class MatchCog(commands.Cog):
             game = self.game
 
             class BetModal(Modal, title="배팅 금액 입력"):
-                amount = TextInput(label="배팅할 금액", placeholder="숫자만 입력 (최소 1000₽)", required=True)
+                amount = TextInput(label="배팅할 금액", placeholder="숫자만 입력 (최소 1000P)", required=True)
 
                 def __init__(self, game: Game, team: int):
                     super().__init__()
@@ -685,7 +685,7 @@ class MatchCog(commands.Cog):
                     try:
                         amount_int = int(self.amount.value)
                         if amount_int < 1000:
-                            await modal_interaction.response.send_message("❌ 최소 배팅 금액은 1000₽입니다.", ephemeral=True)
+                            await modal_interaction.response.send_message("❌ 최소 배팅 금액은 1000P입니다.", ephemeral=True)
                             return
                     except:
                         await modal_interaction.response.send_message("❌ 숫자만 입력해 주세요.", ephemeral=True)
@@ -702,7 +702,7 @@ class MatchCog(commands.Cog):
 
                     self.game.bets[user_id] = {"amount": amount_int, "team": self.team}
                     await modal_interaction.response.send_message(
-                        f"✅ {modal_interaction.user.mention}님이 {self.team}팀에 {amount_int}₽ 배팅했습니다.",
+                        f"✅ {modal_interaction.user.mention}님이 {self.team}팀에 {amount_int}P 배팅했습니다.",
                         ephemeral=False
                     )
 
@@ -748,7 +748,7 @@ class MatchCog(commands.Cog):
 
             embed = interaction.message.embeds[0]
             embed.add_field(name="결과", value="✅ 1팀 승리!", inline=False)
-            embed.add_field(name="💸 배당 결과", value=betting_result, inline=False)
+            embed.add_field(name="🪙 배당 결과", value=betting_result, inline=False)
             await interaction.response.edit_message(embed=embed, view=self)
 
         @discord.ui.button(label="2팀 승리", style=discord.ButtonStyle.danger)
