@@ -1,4 +1,4 @@
-Discord Bot README (내전/전적/배팅/경제/관리/기타)
+#Discord Bot README (내전/전적/배팅/경제/관리/기타)
 
 접두사: !
 런타임: Python + discord.py
